@@ -10,8 +10,44 @@ const axios = require('axios');
 const { WebSocket, createWebSocketStream } = require('ws');
 const { subtle } = crypto.webcrypto;
 
-// ========================== 环境变量配置 ==========================
-const UUID = process.env.UUID || 'd1cf4b9c-3e57-085d-b34a-797fcf601381';
+// ========================== UUID (auto-generate + simpan ke uuid.txt) ==========================
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function loadOrCreateUUID() {
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // __dirname read-only di Vercel → fallback ke /tmp (writable antar warm invocations)
+  const files = [path.join(__dirname, 'uuid.txt'), path.join('/tmp', 'uuid.txt')];
+
+  for (const f of files) {
+    try {
+      const v = fs.readFileSync(f, 'utf8').trim();
+      if (UUID_REGEX.test(v)) {
+        console.log('[UUID] loaded from', f);
+        return v;
+      }
+    } catch {}
+  }
+
+  const newUUID = generateUUID();
+  for (const f of files) {
+    try {
+      fs.writeFileSync(f, newUUID, 'utf8');
+      console.log('[UUID] saved to', f, '→', newUUID);
+      return newUUID;
+    } catch {}
+  }
+  console.warn('[UUID] tidak bisa menulis uuid.txt, memakai ephemeral UUID:', newUUID);
+  return newUUID;
+}
+
+// ========================== Environment ==========================
+const UUID = loadOrCreateUUID();
 const SUB_PATH = process.env.SUB_PATH || 'vercel';
 const NAME = process.env.NAME || 'Vercel';
 const PORT = process.env.PORT || 3000;
@@ -28,7 +64,7 @@ const WS_PATHS = {
   vmess:  '/vmess',
 };
 
-// ==================== KONFIG UMUM ====================
+// ==================== Konfigurasi umum ====================
 let uuid = UUID.replace(/-/g, ""), ISP = '';
 const DNS_SERVERS = ['8.8.4.4', '1.1.1.1'];
 const DOH_SERVERS = ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'];
@@ -97,7 +133,7 @@ function resolveHost(host) {
   });
 }
 
-// ==================== CRYPTO HELPERS (port dari CF Worker) ====================
+// ==================== Crypto helpers ====================
 const str2arr = (str) => new TextEncoder().encode(str);
 const arr2str = (arr) => new TextDecoder().decode(arr);
 
@@ -119,10 +155,6 @@ function toBuffer(uuidStr) {
   const arr = new Uint8Array(16);
   for (let i = 0; i < 16; i++) arr[i] = parseInt(hex.substr(i * 2, 2), 16);
   return arr;
-}
-
-function arrayBufferToHex(buffer) {
-  return [...new Uint8Array(buffer)].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
 function sha256(message) {
@@ -212,7 +244,7 @@ async function aesGcmEncrypt(key, iv, data, aad) {
   return new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad || new Uint8Array(0), tagLength: 128 }, cryptoKey, data));
 }
 
-// ==================== VMESS AEAD CONSTANTS ====================
+// ==================== VMess AEAD constants ====================
 const KDFSALT_LEN_KEY = str2arr("VMess Header AEAD Key_Length");
 const KDFSALT_LEN_IV  = str2arr("VMess Header AEAD Nonce_Length");
 const KDFSALT_PAYLOAD_KEY = str2arr("VMess Header AEAD Key");
@@ -222,7 +254,7 @@ const KDFSALT_RESP_LEN_IV  = str2arr("AEAD Resp Header Len IV");
 const KDFSALT_RESP_HDR_KEY = str2arr("AEAD Resp Header Key");
 const KDFSALT_RESP_HDR_IV  = str2arr("AEAD Resp Header IV");
 
-// ==================== VMESS AEAD PARSER ====================
+// ==================== VMess AEAD parser ====================
 async function parseP4Header(buffer, uuidBytes) {
   if (buffer.length < 42) throw new Error("Data too short");
   const auth_id = buffer.subarray(0, 16);
@@ -292,7 +324,7 @@ async function parseP4Header(buffer, uuidBytes) {
   };
 }
 
-// ==================== BUILD SUBSCRIPTION (VLESS + Trojan + SS + VMess) ====================
+// ==================== Build subscription ====================
 async function buildSubscription(req) {
   await getisp();
   const { domain } = getEndpointInfo(req);
@@ -312,7 +344,6 @@ async function buildSubscription(req) {
     ? `ss://${ssB64}@${domain}:443?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${domain};path%3D%2Fss;tls;sni%3D${domain};skip-cert-verify%3Dtrue;mux%3D0#${namePart}-TLS`
     : `ss://${ssB64}@${domain}:80?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${domain};path%3D%2Fss;skip-cert-verify%3Dtrue;mux%3D0#${namePart}`;
 
-  // VMess: alterId=0 (AEAD), security auto (=none over WS+TLS)
   const vmessURI = (tls) => {
     const cfg = {
       v: '2',
@@ -321,7 +352,7 @@ async function buildSubscription(req) {
       port: tls ? '443' : '80',
       id: UUID,
       aid: '0',
-      scy: 'auto',
+      scy: 'zero',
       net: 'ws',
       type: 'none',
       host: domain,
@@ -350,7 +381,7 @@ async function buildSubscription(req) {
   return configs.join('\n');
 }
 
-// ==================== HTTP SERVER ====================
+// ==================== HTTP server ====================
 const httpServer = http.createServer(async (req, res) => {
   if (req.url === '/') {
     const filePath = path.join(__dirname, 'index.html');
@@ -374,7 +405,7 @@ const httpServer = http.createServer(async (req, res) => {
   }
 });
 
-// ==================== HANDLER VLESS ====================
+// ==================== VLESS handler ====================
 function handleVlsConnection(ws, msg) {
   const [VERSION] = msg;
   const id = msg.slice(1, 17);
@@ -406,7 +437,7 @@ function handleVlsConnection(ws, msg) {
   return true;
 }
 
-// ==================== HANDLER TROJAN ====================
+// ==================== Trojan handler ====================
 function handleTrojConnection(ws, msg) {
   try {
     if (msg.length < 58) return false;
@@ -444,7 +475,7 @@ function handleTrojConnection(ws, msg) {
   } catch { return false; }
 }
 
-// ==================== HANDLER SS ====================
+// ==================== SS handler ====================
 function handleSsConnection(ws, msg) {
   try {
     let offset = 0;
@@ -474,7 +505,7 @@ function handleSsConnection(ws, msg) {
   } catch { return false; }
 }
 
-// ==================== HANDLER VMESS (AEAD) ====================
+// ==================== VMess handler (AEAD) ====================
 function setupUDPHandler(ws, responseHeader, initialChunk) {
   let isHeaderSent = false;
 
@@ -523,7 +554,6 @@ async function handleVmessConnection(ws, msg) {
   let udpHandler = null;
   const pendingWrites = [];
 
-  // Register EARLY to avoid losing frames during async header parsing
   ws.on('message', (m) => {
     try {
       if (udpHandler) { udpHandler.write(new Uint8Array(m)); return; }
@@ -554,7 +584,6 @@ async function handleVmessConnection(ws, msg) {
       return false;
     }
 
-    // TCP path
     let host = addressRemote;
     try { host = await resolveHost(addressRemote); } catch { /* use domain */ }
 
@@ -594,7 +623,7 @@ async function handleVmessConnection(ws, msg) {
   }
 }
 
-// ==================== WebSocket DISPATCHER ====================
+// ==================== WebSocket dispatcher ====================
 const wss = new WebSocket.Server({ server: httpServer });
 wss.on('connection', (ws, req) => {
   const pathOnly = (req.url || '').split('?')[0];
@@ -617,8 +646,9 @@ wss.on('connection', (ws, req) => {
   }).on('error', () => {});
 });
 
-// ==================== START ====================
+// ==================== Start ====================
 httpServer.listen(PORT, () => {
   console.log(`Server is running on ${PORT}`);
+  console.log(`UUID: ${UUID}`);
   console.log(`WS paths → ${WS_PATHS.vless}, ${WS_PATHS.trojan}, ${WS_PATHS.ss}, ${WS_PATHS.vmess}`);
 });
