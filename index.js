@@ -4,40 +4,35 @@ const http = require('http');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
-const crypto = require('crypto');
+const { createHash, createHmac, createCipheriv, createDecipheriv, timingSafeEqual, randomBytes } = require('crypto');
 const { Buffer } = require('buffer');
 const axios = require('axios');
 const { WebSocket, createWebSocketStream } = require('ws');
-const { subtle } = crypto.webcrypto;
 
 // ========================== Environment ==========================
 const UUID = process.env.UUID || 'd1cf4b9c-3e57-085d-b34a-797fcf601381';
+// Default dibuat 'vercel' sesuai request form Web UI
 const SUB_PATH = process.env.SUB_PATH || 'vercel';
-const NAME = process.env.NAME || 'Vercel';
+const NAME = process.env.NAME || 'Vercel-Node';
 const PORT = process.env.PORT || 3000;
 
 const SHOW_LOG = !!(process.env.SHOW_LOG);
 function log(...args) { if (SHOW_LOG) console.log(...args); }
 function logErr(...args) { if (SHOW_LOG) console.error(...args); }
 
-// ============== Path per protokol ==============
 const WS_PATHS = {
   vless:  '/vless',
   trojan: '/trojan',
-  ss:     '/ss',
   vmess:  '/vmess',
 };
 
-// ==================== Konfigurasi umum ====================
-let uuid = UUID.replace(/-/g, ""), ISP = '';
+let uuidClean = UUID.replace(/-/g, ""), ISP = '';
 const DNS_SERVERS = ['8.8.4.4', '1.1.1.1'];
-const DOH_SERVERS = ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'];
 const BLOCKED_DOMAINS = [
   'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
   'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
 ];
 const IPV4_REGEX = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-const DNS_PORT = 53;
 
 function getEndpointInfo(req) {
   const rawHost = (req.headers['x-forwarded-host'] || req.headers.host || 'localhost').split(',')[0].trim();
@@ -51,7 +46,6 @@ function getEndpointInfo(req) {
     portFromHeader = parseInt(rawHost.slice(colonIdx + 1), 10);
   }
   if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1);
-
   const port = portFromHeader || (isTLS ? 443 : (parseInt(PORT, 10) || 80));
   return { domain: hostname || 'localhost', port, tls: isTLS ? 'tls' : 'none' };
 }
@@ -97,283 +91,558 @@ function resolveHost(host) {
   });
 }
 
-// ==================== Crypto helpers ====================
-const str2arr = (str) => new TextEncoder().encode(str);
-const arr2str = (arr) => new TextDecoder().decode(arr);
+// ==================== Engine Kripto VMess AEAD ====================
+const ATYP_IPV4 = 0x01;
+const ATYP_DOMAIN = 0x02;
+const ATYP_IPV6 = 0x03;
+const CMD_TCP = 0x01;
+const CMD_MUX = 0x03;
 
-const concat = (...arrays) => {
-  const result = new Uint8Array(arrays.reduce((sum, arr) => sum + arr.length, 0));
-  let offset = 0;
-  for (const arr of arrays) { result.set(arr, offset); offset += arr.length; }
-  return result;
-};
+const VMESS_SECURITY_AES128_GCM = 3;
+const VMESS_SECURITY_CHACHA20_POLY1305 = 4;
+const VMESS_SECURITY_NONE = 5;
+const VMESS_SECURITY_ZERO = 6;
+const VMESS_OPT_CHUNK_STREAM = 0x01;
+const VMESS_OPT_CHUNK_MASKING = 0x04;
+const VMESS_OPT_GLOBAL_PADDING = 0x08;
+const VMESS_OPT_AUTHENTICATED_LENGTH = 0x10;
+const VMESS_CMD_KEY_SALT = 'c48619fe-8f02-49e0-b9e9-edf763e17e21';
 
-const alloc = (size, fill = 0) => {
-  const arr = new Uint8Array(size);
-  if (fill) arr.fill(fill);
-  return arr;
-};
+function utf8(text) { return new TextEncoder().encode(String(text)); }
 
-function toBuffer(uuidStr) {
-  const hex = uuidStr.replace(/-/g, '');
-  const arr = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) arr[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return arr;
-}
+const KDF_ROOT = utf8('VMess AEAD KDF');
+const KDF_AUTH_ID = utf8('AES Auth ID Encryption');
+const KDF_HDR_LEN_KEY = utf8('VMess Header AEAD Key_Length');
+const KDF_HDR_LEN_IV = utf8('VMess Header AEAD Nonce_Length');
+const KDF_HDR_KEY = utf8('VMess Header AEAD Key');
+const KDF_HDR_IV = utf8('VMess Header AEAD Nonce');
+const KDF_RESP_LEN_KEY = utf8('AEAD Resp Header Len Key');
+const KDF_RESP_LEN_IV = utf8('AEAD Resp Header Len IV');
+const KDF_RESP_KEY = utf8('AEAD Resp Header Key');
+const KDF_RESP_IV = utf8('AEAD Resp Header IV');
+const KDF_AUTH_LEN = utf8('auth_len');
 
-function sha256(message) {
-  const msg = message instanceof Uint8Array ? message : str2arr(message);
-  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
-  let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
-  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-  const len = msg.length, paddingLen = ((56 - (len + 1) % 64) + 64) % 64;
-  const padded = new Uint8Array(len + 1 + paddingLen + 8);
-  padded.set(msg); padded[len] = 0x80;
-  new DataView(padded.buffer).setUint32(padded.length - 4, len * 8, false);
-  const W = new Uint32Array(64);
-  for (let i = 0; i < padded.length; i += 64) {
-    const block = new DataView(padded.buffer, i, 64);
-    for (let t = 0; t < 16; t++) W[t] = block.getUint32(t * 4, false);
-    for (let t = 16; t < 64; t++) {
-      const s0 = rotr(W[t - 15], 7) ^ rotr(W[t - 15], 18) ^ (W[t - 15] >>> 3);
-      const s1 = rotr(W[t - 2], 17) ^ rotr(W[t - 2], 19) ^ (W[t - 2] >>> 10);
-      W[t] = (W[t - 16] + s0 + W[t - 7] + s1) >>> 0;
-    }
-    let [a, b, c, d, e, f, g, h] = H;
-    for (let t = 0; t < 64; t++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g), T1 = (h + S1 + ch + K[t] + W[t]) >>> 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), maj = (a & b) ^ (a & c) ^ (b & c), T2 = (S0 + maj) >>> 0;
-      h = g; g = f; f = e; e = (d + T1) >>> 0; d = c; c = b; b = a; a = (T1 + T2) >>> 0;
-    }
-    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
-    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+const CRC32_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) { c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1); }
+    t[i] = c >>> 0;
   }
-  const result = new Uint8Array(32), rv = new DataView(result.buffer);
-  for (let i = 0; i < 8; i++) rv.setUint32(i * 4, H[i], false);
-  return result;
+  return t;
+})();
+
+function toU8Sync(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (Buffer.isBuffer(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new TypeError('expected binary data');
 }
 
-function md5(data, salt) {
-  let msg = data instanceof Uint8Array ? data : str2arr(data);
-  if (salt) msg = concat(msg, salt instanceof Uint8Array ? salt : str2arr(salt));
-  const K = [0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391];
-  const S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
-  let [a, b, c, d] = [0x67452301,0xefcdab89,0x98badcfe,0x10325476];
-  const len = msg.length, paddingLen = ((56 - (len + 1) % 64) + 64) % 64, padded = new Uint8Array(len + 1 + paddingLen + 8);
-  padded.set(msg); padded[len] = 0x80;
-  const view = new DataView(padded.buffer);
-  view.setUint32(padded.length - 8, (len * 8) >>> 0, true);
-  view.setUint32(padded.length - 4, Math.floor(len * 8 / 0x100000000) >>> 0, true);
-  const rotl = (x, n) => (x << n) | (x >>> (32 - n));
-  for (let i = 0; i < padded.length; i += 64) {
-    const M = new Uint32Array(16);
-    for (let j = 0; j < 16; j++) M[j] = view.getUint32(i + j * 4, true);
-    let [A, B, C, D] = [a, b, c, d];
-    for (let j = 0; j < 64; j++) {
-      let F, g;
-      if (j < 16) { F = (B & C) | (~B & D); g = j; }
-      else if (j < 32) { F = (D & B) | (~D & C); g = (5 * j + 1) % 16; }
-      else if (j < 48) { F = B ^ C ^ D; g = (3 * j + 5) % 16; }
-      else { F = C ^ (B | ~D); g = (7 * j) % 16; }
-      F = (F + A + K[j] + M[g]) >>> 0; A = D; D = C; C = B; B = (B + rotl(F, S[j])) >>> 0;
-    }
-    a = (a + A) >>> 0; b = (b + B) >>> 0; c = (c + C) >>> 0; d = (d + D) >>> 0;
+function concatBytes(...parts) {
+  const list = parts.filter((p) => p && p.byteLength !== 0).map(toU8Sync);
+  const total = list.reduce((n, p) => n + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of list) { out.set(p, off); off += p.byteLength; }
+  return out;
+}
+
+function md5(data) { return new Uint8Array(createHash('md5').update(Buffer.from(toU8Sync(data))).digest()); }
+function sha256(data) { return new Uint8Array(createHash('sha256').update(Buffer.from(toU8Sync(data))).digest()); }
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (const b of toU8Sync(bytes)) c = CRC32_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function fnv1a32(bytes) {
+  let h = 0x811c9dc5;
+  for (const b of toU8Sync(bytes)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+
+function hmacSha256(key, data) {
+  return new Uint8Array(createHmac('sha256', Buffer.from(toU8Sync(key))).update(Buffer.from(toU8Sync(data))).digest());
+}
+
+function hmacWithHash(hashFn, key, data) {
+  let k = toU8Sync(key);
+  if (k.byteLength > 64) k = hashFn(k);
+  const kb = new Uint8Array(64);
+  kb.set(k);
+  const ipad = new Uint8Array(64), opad = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { ipad[i] = kb[i] ^ 0x36; opad[i] = kb[i] ^ 0x5c; }
+  return hashFn(concatBytes(opad, hashFn(concatBytes(ipad, data))));
+}
+
+function vmessKdf(key, ...pathParts) {
+  let hashFn = (data) => hmacSha256(KDF_ROOT, data);
+  for (const p of pathParts) {
+    const prev = hashFn;
+    const path = typeof p === 'string' ? utf8(p) : toU8Sync(p).slice();
+    hashFn = (data) => hmacWithHash(prev, path, data);
   }
-  const result = new Uint8Array(16), rv = new DataView(result.buffer);
-  rv.setUint32(0, a, true); rv.setUint32(4, b, true); rv.setUint32(8, c, true); rv.setUint32(12, d, true);
-  return result;
+  return hashFn(toU8Sync(key));
 }
 
-function createRecursiveHash(key, underlyingHashFn) {
-  const ipad = alloc(64, 0x36), opad = alloc(64, 0x5c);
-  const keyBuf = key instanceof Uint8Array ? key : str2arr(key);
-  for (let i = 0; i < keyBuf.length; i++) { ipad[i] ^= keyBuf[i]; opad[i] ^= keyBuf[i]; }
-  return (data) => underlyingHashFn(concat(opad, underlyingHashFn(concat(ipad, data))));
+function vmessKdf16(key, ...pathParts) { return vmessKdf(key, ...pathParts).slice(0, 16); }
+function vmessCmdKey(uuidBytes) { return md5(concatBytes(uuidBytes, utf8(VMESS_CMD_KEY_SALT))); }
+
+function cipherAeadName(security) {
+  if (security === VMESS_SECURITY_AES128_GCM) return 'aes-128-gcm';
+  if (security === VMESS_SECURITY_CHACHA20_POLY1305) return 'chacha20-poly1305';
+  throw new Error(`security ${security} is not AEAD`);
 }
 
-function kdf(key, pathArr) {
-  let fn = sha256;
-  fn = createRecursiveHash(str2arr("VMess AEAD KDF"), fn);
-  for (const p of pathArr) fn = createRecursiveHash(p, fn);
-  return fn(key);
+function chachaKey(key16) {
+  const a = md5(key16), b = md5(a);
+  return concatBytes(a, b);
 }
 
-async function aesGcmDecrypt(key, iv, data, aad) {
-  const cryptoKey = await subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['decrypt']);
-  return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad || new Uint8Array(0), tagLength: 128 }, cryptoKey, data));
+function normalizeAeadKey(security, key) {
+  const k = toU8Sync(key);
+  return security === VMESS_SECURITY_CHACHA20_POLY1305 ? chachaKey(k) : k.slice(0, 16);
 }
 
-async function aesGcmEncrypt(key, iv, data, aad) {
-  const cryptoKey = await subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['encrypt']);
-  return new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad || new Uint8Array(0), tagLength: 128 }, cryptoKey, data));
+function aeadSeal(security, key, nonce, plain, aad = null) {
+  const name = cipherAeadName(security);
+  const cipher = createCipheriv(name, Buffer.from(normalizeAeadKey(security, key)), Buffer.from(toU8Sync(nonce)), { authTagLength: 16 });
+  if (aad && toU8Sync(aad).byteLength) cipher.setAAD(Buffer.from(toU8Sync(aad)), { plaintextLength: toU8Sync(plain).byteLength });
+  const c = Buffer.concat([cipher.update(Buffer.from(toU8Sync(plain))), cipher.final()]);
+  return concatBytes(c, cipher.getAuthTag());
 }
 
-// ==================== VMess AEAD constants ====================
-const KDFSALT_LEN_KEY = str2arr("VMess Header AEAD Key_Length");
-const KDFSALT_LEN_IV  = str2arr("VMess Header AEAD Nonce_Length");
-const KDFSALT_PAYLOAD_KEY = str2arr("VMess Header AEAD Key");
-const KDFSALT_PAYLOAD_IV  = str2arr("VMess Header AEAD Nonce");
-const KDFSALT_RESP_LEN_KEY = str2arr("AEAD Resp Header Len Key");
-const KDFSALT_RESP_LEN_IV  = str2arr("AEAD Resp Header Len IV");
-const KDFSALT_RESP_HDR_KEY = str2arr("AEAD Resp Header Key");
-const KDFSALT_RESP_HDR_IV  = str2arr("AEAD Resp Header IV");
+function aeadOpen(security, key, nonce, sealed, aad = null) {
+  const input = toU8Sync(sealed);
+  if (input.byteLength < 16) throw new Error('AEAD ciphertext too short');
+  const name = cipherAeadName(security);
+  const body = input.subarray(0, input.byteLength - 16);
+  const tag = input.subarray(input.byteLength - 16);
+  const decipher = createDecipheriv(name, Buffer.from(normalizeAeadKey(security, key)), Buffer.from(toU8Sync(nonce)), { authTagLength: 16 });
+  if (aad && toU8Sync(aad).byteLength) decipher.setAAD(Buffer.from(toU8Sync(aad)), { plaintextLength: body.byteLength });
+  decipher.setAuthTag(Buffer.from(tag));
+  return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(body)), decipher.final()]));
+}
 
-// ==================== VMess AEAD parser ====================
-async function parseP4Header(buffer, uuidBytes) {
-  if (buffer.length < 42) throw new Error("Data too short");
-  const auth_id = buffer.subarray(0, 16);
-  let remaining = buffer.subarray(16);
+function aesEcbDecryptBlock(key, block) {
+  const decipher = createDecipheriv('aes-128-cbc', Buffer.from(toU8Sync(key)), Buffer.alloc(16));
+  decipher.setAutoPadding(false);
+  return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(toU8Sync(block))), decipher.final()]));
+}
 
-  const len_encrypted = remaining.subarray(0, 18);
-  remaining = remaining.subarray(18);
-  const nonce = remaining.subarray(0, 8);
-  remaining = remaining.subarray(8);
+function uuidToBytes(text) {
+  const s = String(text || '').trim().toLowerCase();
+  return new Uint8Array(Buffer.from(s.replaceAll('-', ''), 'hex'));
+}
 
-  const key = md5(uuidBytes, str2arr("c48619fe-8f02-49e0-b9e9-edf763e17e21"));
-  const header_length_key = kdf(key, [KDFSALT_LEN_KEY, auth_id, nonce]).subarray(0, 16);
-  const header_length_nonce = kdf(key, [KDFSALT_LEN_IV, auth_id, nonce]).subarray(0, 12);
-  const decryptedLen = await aesGcmDecrypt(header_length_key, header_length_nonce, len_encrypted, auth_id);
-  const header_length = (decryptedLen[0] << 8) | decryptedLen[1];
-  if (header_length <= 0 || header_length > 4096) throw new Error("Invalid header length");
-
-  const cmd_encrypted = remaining.subarray(0, header_length + 16);
-  const rawClientData = remaining.subarray(header_length + 16);
-
-  const payload_key = kdf(key, [KDFSALT_PAYLOAD_KEY, auth_id, nonce]).subarray(0, 16);
-  const payload_nonce = kdf(key, [KDFSALT_PAYLOAD_IV, auth_id, nonce]).subarray(0, 12);
-  const cmdBuf = await aesGcmDecrypt(payload_key, payload_nonce, cmd_encrypted, auth_id);
-
-  if (cmdBuf[0] !== 1) throw new Error("Invalid VMess version");
-  const cmd = cmdBuf[37];
-  if (cmd !== 1 && cmd !== 2) throw new Error(`Unsupported cmd ${cmd}`);
-  const isUDP = cmd === 2;
-
-  const portRemote = (cmdBuf[38] << 8) | cmdBuf[39];
-  let addressRemote = "";
-  const addrType = cmdBuf[40];
-
-  if (addrType === 1) {
-    addressRemote = `${cmdBuf[41]}.${cmdBuf[42]}.${cmdBuf[43]}.${cmdBuf[44]}`;
-  } else if (addrType === 2) {
-    const len = cmdBuf[41];
-    addressRemote = arr2str(cmdBuf.subarray(42, 42 + len));
-  } else if (addrType === 3) {
+function tryParsePortFirstAddress(bytes, cursor, addressType) {
+  const b = toU8Sync(bytes);
+  if (addressType === ATYP_IPV4) {
+    if (b.byteLength < cursor + 4) return null;
+    return { address: Array.from(b.subarray(cursor, cursor + 4)).join('.'), next: cursor + 4 };
+  }
+  if (addressType === ATYP_DOMAIN) {
+    if (b.byteLength < cursor + 1) return null;
+    const len = b[cursor++];
+    if (!len || b.byteLength < cursor + len) return null;
+    return { address: new TextDecoder('utf-8', { fatal: true }).decode(b.subarray(cursor, cursor + len)), next: cursor + len };
+  }
+  if (addressType === ATYP_IPV6) {
+    if (b.byteLength < cursor + 16) return null;
     const parts = [];
-    for (let i = 0; i < 8; i++) parts.push(((cmdBuf[41 + i * 2] << 8) | cmdBuf[41 + i * 2 + 1]).toString(16));
-    addressRemote = parts.join(':');
-  } else {
-    throw new Error(`Invalid addr type ${addrType}`);
+    for (let i = 0; i < 16; i += 2) parts.push(((b[cursor + i] << 8) | b[cursor + i + 1]).toString(16));
+    return { address: parts.join(':'), next: cursor + 16 };
+  }
+  throw new Error(`invalid address type ${addressType}`);
+}
+
+function tryParseVmessHeader(bytes, uuidBytes, nowSec = Math.floor(Date.now() / 1000)) {
+  const b = toU8Sync(bytes);
+  if (b.byteLength < 16) return null;
+  const cmdKey = vmessCmdKey(uuidBytes);
+  const authID = b.slice(0, 16);
+  let authPlain;
+  try {
+    authPlain = aesEcbDecryptBlock(vmessKdf16(cmdKey, KDF_AUTH_ID), authID);
+  } catch { return null; }
+
+  const dv = new DataView(authPlain.buffer, authPlain.byteOffset, authPlain.byteLength);
+  const timestamp = Number(dv.getBigInt64(0, false));
+  if (dv.getUint32(12, false) !== crc32(authPlain.subarray(0, 12)) || Math.abs(timestamp - nowSec) > 120) {
+    return null;
+  }
+  if (b.byteLength < 42) return null;
+
+  const encLen = b.subarray(16, 34);
+  const connNonce = b.subarray(34, 42);
+  let lengthPlain;
+  try {
+    lengthPlain = aeadOpen(VMESS_SECURITY_AES128_GCM, vmessKdf16(cmdKey, KDF_HDR_LEN_KEY, authID, connNonce), vmessKdf(cmdKey, KDF_HDR_LEN_IV, authID, connNonce).slice(0, 12), encLen, authID);
+  } catch { return null; }
+
+  const plainLen = (lengthPlain[0] << 8) | lengthPlain[1];
+  const total = 42 + plainLen + 16;
+  if (b.byteLength < total) return null;
+
+  let plain;
+  try {
+    plain = aeadOpen(VMESS_SECURITY_AES128_GCM, vmessKdf16(cmdKey, KDF_HDR_KEY, authID, connNonce), vmessKdf(cmdKey, KDF_HDR_IV, authID, connNonce).slice(0, 12), b.subarray(42, total), authID);
+  } catch { return null; }
+
+  const requestBodyIV = plain.slice(1, 17);
+  const requestBodyKey = plain.slice(17, 33);
+  const responseHeader = plain[33];
+  let option = plain[34];
+  const wireSecurity = plain[35] & 0x0f;
+  const command = plain[37];
+  let security = wireSecurity;
+  if (security === VMESS_SECURITY_ZERO) {
+    security = VMESS_SECURITY_NONE;
+    option &= ~(VMESS_OPT_CHUNK_STREAM | VMESS_OPT_CHUNK_MASKING | VMESS_OPT_GLOBAL_PADDING | VMESS_OPT_AUTHENTICATED_LENGTH);
   }
 
-  const respKeyBase = sha256(cmdBuf.subarray(17, 33)).subarray(0, 16);
-  const respIvBase  = sha256(cmdBuf.subarray(1, 17)).subarray(0, 16);
-  const encryptedLength = await aesGcmEncrypt(
-    kdf(respKeyBase, [KDFSALT_RESP_LEN_KEY]).subarray(0, 16),
-    kdf(respIvBase,  [KDFSALT_RESP_LEN_IV]).subarray(0, 12),
-    new Uint8Array([0, 4])
-  );
-  const encryptedHeaderPayload = await aesGcmEncrypt(
-    kdf(respKeyBase, [KDFSALT_RESP_HDR_KEY]).subarray(0, 16),
-    kdf(respIvBase,  [KDFSALT_RESP_HDR_IV]).subarray(0, 12),
-    new Uint8Array([cmdBuf[33], 0, 0, 0])
-  );
+  let p = 38, address = 'v1.mux.cool', port = 0, addressType = ATYP_DOMAIN;
+  if (command !== CMD_MUX) {
+    port = (plain[p] << 8) | plain[p + 1];
+    p += 2;
+    addressType = plain[p++];
+    const a = tryParsePortFirstAddress(plain, p, addressType);
+    if (!a) throw new Error('truncated destination');
+    address = a.address;
+    p = a.next;
+  }
+
+  const checksumPos = plain.byteLength - 4;
+  if (fnv1a32(plain.subarray(0, checksumPos)) !== new DataView(plain.buffer, plain.byteOffset + checksumPos, 4).getUint32(0, false)) {
+    throw new Error('invalid VMess checksum');
+  }
 
   return {
-    hasError: false,
-    addressRemote,
-    portRemote,
-    rawClientData,
-    version: concat(encryptedLength, encryptedHeaderPayload),
-    isUDP
+    command, address, port, addressType, option, security, wireSecurity,
+    requestBodyIV, requestBodyKey, responseHeader, headerLength: total, authID,
+    responseBodyKey: sha256(requestBodyKey).slice(0, 16),
+    responseBodyIV: sha256(requestBodyIV).slice(0, 16),
   };
 }
 
-// ==================== Build subscription ====================
-async function buildSubscription(req) {
-  await getisp();
-  const { domain } = getEndpointInfo(req);
-  const namePart = NAME ? `${NAME}-${ISP}` : ISP;
-  const isIP = IPV4_REGEX.test(domain);
-  const ssB64 = Buffer.from(`none:${UUID}`).toString('base64');
-
-  const vlessURI = (tls) => tls
-    ? `vless://${UUID}@${domain}:443?path=%2Fvless&security=tls&encryption=none&host=${domain}&fp=chrome&type=ws&sni=${domain}#${namePart}-TLS`
-    : `vless://${UUID}@${domain}:80?path=%2Fvless&security=none&encryption=none&host=${domain}&fp=chrome&type=ws#${namePart}`;
-
-  const trojanURI = (tls) => tls
-    ? `trojan://${UUID}@${domain}:443?path=%2Ftrojan&security=tls&host=${domain}&fp=chrome&type=ws&sni=${domain}#${namePart}-TLS`
-    : `trojan://${UUID}@${domain}:80?path=%2Ftrojan&security=none&host=${domain}&fp=chrome&type=ws#${namePart}`;
-
-  const ssURI = (tls) => tls
-    ? `ss://${ssB64}@${domain}:443?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${domain};path%3D%2Fss;tls;sni%3D${domain};skip-cert-verify%3Dtrue;mux%3D0#${namePart}-TLS`
-    : `ss://${ssB64}@${domain}:80?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${domain};path%3D%2Fss;skip-cert-verify%3Dtrue;mux%3D0#${namePart}`;
-
-  const vmessURI = (tls) => {
-    const cfg = {
-      v: '2',
-      ps: tls ? `${namePart}-TLS` : namePart,
-      add: domain,
-      port: tls ? '443' : '80',
-      id: UUID,
-      aid: '0',
-      scy: 'zero',
-      net: 'ws',
-      type: 'none',
-      host: domain,
-      path: '/vmess',
-      tls: tls ? 'tls' : '',
-      sni: tls ? domain : '',
-      alpn: '',
-      fp: ''
-    };
-    return `vmess://${Buffer.from(JSON.stringify(cfg)).toString('base64')}`;
-  };
-
-  const configs = [];
-  if (isIP) {
-    configs.push(
-      vlessURI(false), trojanURI(false), ssURI(false), vmessURI(false)
-    );
-  } else {
-    configs.push(
-      vlessURI(true),  vlessURI(false),
-      trojanURI(true), trojanURI(false),
-      ssURI(true),     ssURI(false),
-      vmessURI(true),  vmessURI(false),
-    );
+class NonceCounter {
+  constructor(iv) {
+    this.base = toU8Sync(iv).slice();
+    this.count = 0;
   }
-  return configs.join('\n');
+  next(size = 12) {
+    const out = this.base.slice();
+    out[0] = (this.count >>> 8) & 0xff;
+    out[1] = this.count & 0xff;
+    this.count = (this.count + 1) & 0xffff;
+    return out.slice(0, size);
+  }
 }
 
-// ==================== HTTP server ====================
-const httpServer = http.createServer(async (req, res) => {
-  if (req.url === '/') {
-    const filePath = path.join(__dirname, 'index.html');
-    fs.readFile(filePath, 'utf8', (err, content) => {
-      if (err) { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('Hello world!'); return; }
-      res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(content);
-    });
-    return;
-  } else if (req.url.split('?')[0] === `/${SUB_PATH}`) {
-    try {
-      const subscription = await buildSubscription(req);
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end(Buffer.from(subscription).toString('base64') + '\n');
-    } catch (err) {
-      logErr('[SUB] error:', err.message);
-      res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end('Internal Server Error\n');
+// Shake128 XOF
+const KECCAK64_MASK = (1n << 64n) - 1n;
+const KECCAK_ROTC = [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14];
+const KECCAK_RC = [
+  0x0000000000000001n, 0x0000000000008082n, 0x800000000000808an, 0x8000000080008000n,
+  0x000000000000808bn, 0x0000000080000001n, 0x8000000080008081n, 0x8000000000008009n,
+  0x000000000000008an, 0x0000000000000088n, 0x0000000080008009n, 0x000000008000000an,
+  0x000000008000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n,
+  0x8000000000008002n, 0x8000000000000080n, 0x000000000000800an, 0x800000008000000an,
+  0x8000000080008081n, 0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n
+];
+
+function rotl64(value, shift) {
+  const n = BigInt(shift & 63);
+  return n === 0n ? (value & KECCAK64_MASK) : (((value << n) | (value >> (64n - n))) & KECCAK64_MASK);
+}
+
+function keccakF1600(state) {
+  const c = new Array(5), d = new Array(5), b = new Array(25);
+  for (const rc of KECCAK_RC) {
+    for (let x = 0; x < 5; x++) c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    for (let x = 0; x < 5; x++) d[x] = c[(x + 4) % 5] ^ rotl64(c[(x + 1) % 5], 1);
+    for (let y = 0; y < 5; y++) {
+      for (let x = 0; x < 5; x++) state[x + 5 * y] = (state[x + 5 * y] ^ d[x]) & KECCAK64_MASK;
     }
-    return;
-  } else {
-    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not Found\n');
+    for (let y = 0; y < 5; y++) {
+      for (let x = 0; x < 5; x++) {
+        const src = x + 5 * y;
+        b[y + 5 * ((2 * x + 3 * y) % 5)] = rotl64(state[src], KECCAK_ROTC[src]);
+      }
+    }
+    for (let y = 0; y < 5; y++) {
+      const row = 5 * y;
+      for (let x = 0; x < 5; x++) state[row + x] = (b[row + x] ^ ((~b[row + ((x + 1) % 5)]) & b[row + ((x + 2) % 5)])) & KECCAK64_MASK;
+    }
+    state[0] = (state[0] ^ rc) & KECCAK64_MASK;
   }
-});
+}
 
-// ==================== VLESS handler ====================
+class Shake128Xof {
+  constructor(input) {
+    this.rate = 168;
+    this.state = Array(25).fill(0n);
+    this.squeezeOffset = 0;
+    this.absorb(toU8Sync(input));
+  }
+  xorBlock(block) {
+    for (let i = 0; i < block.byteLength; i++) {
+      this.state[i >>> 3] ^= BigInt(block[i]) << BigInt((i & 7) * 8);
+    }
+  }
+  absorb(input) {
+    let offset = 0;
+    while (input.byteLength - offset >= this.rate) {
+      this.xorBlock(input.subarray(offset, offset + this.rate));
+      keccakF1600(this.state);
+      offset += this.rate;
+    }
+    const finalBlock = new Uint8Array(this.rate);
+    finalBlock.set(input.subarray(offset));
+    finalBlock[input.byteLength - offset] ^= 0x1f;
+    finalBlock[this.rate - 1] ^= 0x80;
+    this.xorBlock(finalBlock);
+    keccakF1600(this.state);
+  }
+  read(length) {
+    const out = new Uint8Array(length);
+    for (let i = 0; i < length; i++) {
+      if (this.squeezeOffset === this.rate) {
+        keccakF1600(this.state);
+        this.squeezeOffset = 0;
+      }
+      const p = this.squeezeOffset++;
+      out[i] = Number((this.state[p >>> 3] >> BigInt((p & 7) * 8)) & 0xffn);
+    }
+    return out;
+  }
+}
+
+class ShakeSizeParser {
+  constructor(seed) { this.shake = new Shake128Xof(seed); }
+  nextWord() {
+    const b = this.shake.read(2);
+    return (b[0] << 8) | b[1];
+  }
+  decodeSize(bytes) {
+    const b = toU8Sync(bytes);
+    return (((b[0] << 8) | b[1]) ^ this.nextWord()) & 0xffff;
+  }
+  encodeSize(size) {
+    const v = (size ^ this.nextWord()) & 0xffff;
+    return new Uint8Array([v >>> 8, v & 0xff]);
+  }
+  nextPaddingLen() { return this.nextWord() % 64; }
+}
+
+function randomPadding(n) { return n ? new Uint8Array(randomBytes(n)) : new Uint8Array(0); }
+
+// Decoder Chunk VMess dari Client
+class VmessBodyDecoder {
+  constructor(header) {
+    this.header = header;
+    this.pending = new Uint8Array(0);
+    this.awaiting = null;
+    this.done = false;
+    this.zeroRaw = header.wireSecurity === VMESS_SECURITY_ZERO || (header.security === VMESS_SECURITY_NONE && !(header.option & VMESS_OPT_CHUNK_STREAM));
+    this.sizeShake = (header.option & VMESS_OPT_CHUNK_MASKING) ? new ShakeSizeParser(header.requestBodyIV) : null;
+    this.paddingShake = (header.option & VMESS_OPT_GLOBAL_PADDING) ? this.sizeShake : null;
+    this.bodyNonce = new NonceCounter(header.requestBodyIV);
+    this.lengthNonce = new NonceCounter(header.requestBodyIV);
+    this.authLength = !!(header.option & VMESS_OPT_AUTHENTICATED_LENGTH) && [VMESS_SECURITY_AES128_GCM, VMESS_SECURITY_CHACHA20_POLY1305].includes(header.security);
+    this.authLengthKey = this.authLength ? vmessKdf16(header.requestBodyKey, KDF_AUTH_LEN) : null;
+  }
+  push(chunk) {
+    if (this.done) return [];
+    const c = toU8Sync(chunk);
+    if (this.zeroRaw) return c.byteLength ? [c.slice()] : [];
+    this.pending = concatBytes(this.pending, c);
+    const out = [];
+    for (;;) {
+      if (!this.awaiting) {
+        const sizeBytes = this.authLength ? 18 : 2;
+        if (this.pending.byteLength < sizeBytes) break;
+        let padding = 0;
+        if (this.paddingShake && this.header.security !== VMESS_SECURITY_NONE) {
+          padding = this.paddingShake.nextPaddingLen();
+        }
+        let size;
+        const raw = this.pending.slice(0, sizeBytes);
+        if (this.authLength) {
+          const plain = aeadOpen(this.header.security, this.authLengthKey, this.lengthNonce.next(12), raw);
+          size = ((plain[0] << 8) | plain[1]) + 16;
+        } else if (this.sizeShake) {
+          size = this.sizeShake.decodeSize(raw);
+        } else {
+          size = (raw[0] << 8) | raw[1];
+        }
+        this.pending = this.pending.slice(sizeBytes);
+        this.awaiting = { size, padding };
+      }
+      const { size, padding } = this.awaiting;
+      if (this.pending.byteLength < size) break;
+      const frame = this.pending.slice(0, size);
+      this.pending = this.pending.slice(size);
+      this.awaiting = null;
+
+      if (this.header.security === VMESS_SECURITY_NONE) {
+        if (size === 0) { this.done = true; break; }
+        out.push(frame);
+        continue;
+      }
+      if (size === 16 + padding) { this.done = true; break; }
+      const sealed = frame.slice(0, size - padding);
+      out.push(aeadOpen(this.header.security, this.header.requestBodyKey, this.bodyNonce.next(12), sealed));
+    }
+    return out;
+  }
+}
+
+// Encoder Chunk VMess ke arah Client
+class VmessBodyEncoder {
+  constructor(header) {
+    this.header = header;
+    this.responseKey = header.responseBodyKey;
+    this.responseIV = header.responseBodyIV;
+    this.zeroRaw = header.wireSecurity === VMESS_SECURITY_ZERO || (header.security === VMESS_SECURITY_NONE && !(header.option & VMESS_OPT_CHUNK_STREAM));
+    this.sizeShake = (header.option & VMESS_OPT_CHUNK_MASKING) ? new ShakeSizeParser(this.responseIV) : null;
+    this.paddingShake = (header.option & VMESS_OPT_GLOBAL_PADDING) ? this.sizeShake : null;
+    this.bodyNonce = new NonceCounter(this.responseIV);
+    this.lengthNonce = new NonceCounter(header.requestBodyIV);
+    this.authLength = !!(header.option & VMESS_OPT_AUTHENTICATED_LENGTH) && [VMESS_SECURITY_AES128_GCM, VMESS_SECURITY_CHACHA20_POLY1305].includes(header.security);
+    this.authLengthKey = this.authLength ? vmessKdf16(header.requestBodyKey, KDF_AUTH_LEN) : null;
+  }
+  encode(data) {
+    const input = toU8Sync(data);
+    if (this.zeroRaw) return input.slice();
+    const parts = [];
+    for (let off = 0; off < input.byteLength; off += 8192) {
+      parts.push(this.encodeUnit(input.slice(off, Math.min(input.byteLength, off + 8192))));
+    }
+    return concatBytes(...parts);
+  }
+  encodeUnit(plain) {
+    const p = toU8Sync(plain);
+    if (this.header.security === VMESS_SECURITY_NONE) {
+      const size = p.byteLength;
+      const sb = this.sizeShake ? this.sizeShake.encodeSize(size) : new Uint8Array([size >>> 8, size & 0xff]);
+      return concatBytes(sb, p);
+    }
+    const padding = this.paddingShake ? this.paddingShake.nextPaddingLen() : 0;
+    const sealed = aeadSeal(this.header.security, this.responseKey, this.bodyNonce.next(12), p);
+    const size = sealed.byteLength + padding;
+    let sb;
+    if (this.authLength) {
+      const plainSize = size - 16;
+      sb = aeadSeal(this.header.security, this.authLengthKey, this.lengthNonce.next(12), new Uint8Array([plainSize >>> 8, plainSize & 0xff]));
+    } else if (this.sizeShake) {
+      sb = this.sizeShake.encodeSize(size);
+    } else {
+      sb = new Uint8Array([size >>> 8, size & 0xff]);
+    }
+    return concatBytes(sb, sealed, randomPadding(padding));
+  }
+}
+
+function encodeVmessResponseHeader(header) {
+  const plain = new Uint8Array([header.responseHeader, 0x00, 0x00, 0x00]);
+  const lenPlain = new Uint8Array([0x00, plain.byteLength]);
+  const lenKey = vmessKdf16(header.responseBodyKey, KDF_RESP_LEN_KEY);
+  const lenIv = vmessKdf(header.responseBodyIV, KDF_RESP_LEN_IV).slice(0, 12);
+  const payloadKey = vmessKdf16(header.responseBodyKey, KDF_RESP_KEY);
+  const payloadIv = vmessKdf(header.responseBodyIV, KDF_RESP_IV).slice(0, 12);
+  return concatBytes(aeadSeal(VMESS_SECURITY_AES128_GCM, lenKey, lenIv, lenPlain), aeadSeal(VMESS_SECURITY_AES128_GCM, payloadKey, payloadIv, plain));
+}
+
+// ==================== VMess Handler Fixed ====================
+async function handleVmessConnection(ws, msg) {
+  let pendingHeader = toU8Sync(msg);
+  let header = tryParseVmessHeader(pendingHeader, uuidToBytes(UUID));
+
+  if (!header) {
+    ws.close();
+    return false;
+  }
+
+  const remainder = pendingHeader.slice(header.headerLength);
+  const decoder = new VmessBodyDecoder(header);
+  const encoder = new VmessBodyEncoder(header);
+
+  if (isBlockedDomain(header.address)) { ws.close(); return false; }
+
+  // Handshake respons dikirim duluan ke client agar tidak timeout
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(Buffer.from(encodeVmessResponseHeader(header)));
+  }
+
+  let targetHost = header.address;
+  try { targetHost = await resolveHost(header.address); } catch {}
+
+  const tcpSocket = net.connect({ host: targetHost, port: header.port });
+  const pendingQueue = [];
+
+  if (remainder.byteLength > 0) {
+    try {
+      for (const plain of decoder.push(remainder)) {
+        pendingQueue.push(Buffer.from(plain));
+      }
+    } catch (e) {
+      ws.close();
+      return false;
+    }
+  }
+
+  tcpSocket.on('connect', () => {
+    while (pendingQueue.length > 0) {
+      tcpSocket.write(pendingQueue.shift());
+    }
+  });
+
+  ws.on('message', (chunk) => {
+    try {
+      for (const plain of decoder.push(chunk)) {
+        if (!tcpSocket.destroyed) {
+          if (tcpSocket.connecting) {
+            pendingQueue.push(Buffer.from(plain));
+          } else {
+            tcpSocket.write(Buffer.from(plain));
+          }
+        }
+      }
+    } catch (e) {
+      logErr('[VMESS DECODE ERROR]', e.message);
+      ws.close();
+    }
+  });
+
+  tcpSocket.on('data', (plain) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        const encoded = encoder.encode(plain);
+        if (encoded.byteLength) ws.send(Buffer.from(encoded));
+      } catch (e) {
+        logErr('[VMESS ENCODE ERROR]', e.message);
+        tcpSocket.destroy();
+      }
+    }
+  });
+
+  tcpSocket.on('error', () => ws.close());
+  tcpSocket.on('close', () => ws.close());
+  ws.on('close', () => { if (!tcpSocket.destroyed) tcpSocket.destroy(); });
+  ws.on('error', () => { if (!tcpSocket.destroyed) tcpSocket.destroy(); });
+
+  return true;
+}
+
+// ==================== VLESS & Trojan Handler ====================
 function handleVlsConnection(ws, msg) {
   const [VERSION] = msg;
   const id = msg.slice(1, 17);
-  if (!id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16))) return false;
+  if (!id.every((v, i) => v == parseInt(uuidClean.substr(i * 2, 2), 16))) return false;
 
   let i = msg.slice(17, 18).readUInt8() + 19;
   const port = msg.slice(i, i += 2).readUInt16BE(0);
@@ -401,12 +670,11 @@ function handleVlsConnection(ws, msg) {
   return true;
 }
 
-// ==================== Trojan handler ====================
 function handleTrojConnection(ws, msg) {
   try {
     if (msg.length < 58) return false;
     const receivedHash = msg.slice(0, 56).toString();
-    const hash = crypto.createHash('sha224').update(UUID).digest('hex');
+    const hash = createHash('sha224').update(UUID).digest('hex');
     if (hash !== receivedHash) return false;
     let offset = 56;
     if (msg[offset] === 0x0d && msg[offset + 1] === 0x0a) offset += 2;
@@ -439,164 +707,85 @@ function handleTrojConnection(ws, msg) {
   } catch { return false; }
 }
 
-// ==================== SS handler ====================
-function handleSsConnection(ws, msg) {
-  try {
-    let offset = 0;
-    const atyp = msg[offset]; offset += 1;
-    let host, port;
-    if (atyp === 0x01) { host = msg.slice(offset, offset + 4).join('.'); offset += 4; }
-    else if (atyp === 0x03) { const l = msg[offset]; offset += 1; host = msg.slice(offset, offset + l).toString(); offset += l; }
-    else if (atyp === 0x04) { host = msg.slice(offset, offset + 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':'); offset += 16; }
-    else return false;
-    port = msg.readUInt16BE(offset); offset += 2;
-    if (isBlockedDomain(host)) { ws.close(); return false; }
-    const duplex = createWebSocketStream(ws);
-    resolveHost(host)
-      .then(ip => {
-        net.connect({ host: ip, port }, function () {
-          if (offset < msg.length) this.write(msg.slice(offset));
-          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
-      })
-      .catch(() => {
-        net.connect({ host, port }, function () {
-          if (offset < msg.length) this.write(msg.slice(offset));
-          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
-      });
-    return true;
-  } catch { return false; }
-}
+// ==================== Subscription Builder ====================
+async function buildSubscription(req) {
+  await getisp();
+  const { domain } = getEndpointInfo(req);
+  const namePart = NAME ? `${NAME}-${ISP}` : ISP;
 
-// ==================== VMess handler (AEAD) ====================
-function setupUDPHandler(ws, responseHeader, initialChunk) {
-  let isHeaderSent = false;
-
-  const processChunk = async (chunk) => {
-    let offset = 0;
-    while (offset < chunk.length) {
-      if (offset + 2 > chunk.length) break;
-      const len = (chunk[offset] << 8) | chunk[offset + 1];
-      offset += 2;
-      if (offset + len > chunk.length) break;
-      const dnsQuery = chunk.slice(offset, offset + len);
-      offset += len;
-
-      try {
-        const dohUrl = DOH_SERVERS[Math.floor(Math.random() * DOH_SERVERS.length)];
-        const resp = await axios.post(dohUrl, Buffer.from(dnsQuery), {
-          headers: { 'content-type': 'application/dns-message' },
-          responseType: 'arraybuffer',
-          timeout: 5000
-        });
-        const dnsResp = new Uint8Array(resp.data);
-        const lenBuf = new Uint8Array([(dnsResp.length >> 8) & 0xff, dnsResp.length & 0xff]);
-        const packet = concat(lenBuf, dnsResp);
-
-        if (ws.readyState !== WebSocket.OPEN) return;
-
-        if (isHeaderSent) {
-          ws.send(Buffer.from(packet));
-        } else {
-          ws.send(Buffer.concat([Buffer.from(responseHeader), Buffer.from(packet)]));
-          isHeaderSent = true;
-        }
-      } catch (e) {
-        logErr('[DOH] error:', e.message);
-      }
-    }
+  const vlessURI = `vless://${UUID}@${domain}:443?path=%2Fvless&security=tls&encryption=none&host=${domain}&fp=chrome&type=ws&sni=${domain}#${namePart}-VLESS`;
+  const trojanURI = `trojan://${UUID}@${domain}:443?path=%2Ftrojan&security=tls&host=${domain}&fp=chrome&type=ws&sni=${domain}#${namePart}-Trojan`;
+  
+  const vmessConfig = {
+    v: '2',
+    ps: `${namePart}-VMess`,
+    add: domain,
+    port: '443',
+    id: UUID,
+    aid: '0',
+    scy: 'auto',
+    net: 'ws',
+    type: 'none',
+    host: domain,
+    path: '/vmess',
+    tls: 'tls',
+    sni: domain,
+    alpn: '',
+    fp: 'chrome'
   };
+  const vmessURI = `vmess://${Buffer.from(JSON.stringify(vmessConfig)).toString('base64')}`;
 
-  processChunk(new Uint8Array(initialChunk)).catch(e => logErr('[DOH] init error:', e.message));
-  return { write: processChunk };
+  return [vlessURI, trojanURI, vmessURI].join('\n');
 }
 
-async function handleVmessConnection(ws, msg) {
-  const buffer = new Uint8Array(msg);
-  let tcpSocket = null;
-  let udpHandler = null;
-  const pendingWrites = [];
+// ==================== HTTP Server & Routing ====================
+const httpServer = http.createServer(async (req, res) => {
+  const urlPath = req.url.split('?')[0];
 
-  ws.on('message', (m) => {
+  // Routing Subscription: Support /vercel, /sub, dan variabel env
+  if (urlPath === `/${SUB_PATH}` || urlPath === '/vercel' || urlPath === '/sub') {
     try {
-      if (udpHandler) { udpHandler.write(new Uint8Array(m)); return; }
-      if (tcpSocket && !tcpSocket.destroyed) {
-        tcpSocket.write(Buffer.from(m));
-      } else {
-        pendingWrites.push(m);
-      }
-    } catch (e) { logErr('[VMESS] msg error:', e.message); }
-  });
-
-  try {
-    const uuidBytes = toBuffer(UUID);
-    const header = await parseP4Header(buffer, uuidBytes);
-    if (header.hasError) { ws.close(); return false; }
-
-    const { addressRemote, portRemote, rawClientData, version, isUDP } = header;
-
-    if (isBlockedDomain(addressRemote)) { ws.close(); return false; }
-
-    if (isUDP) {
-      if (portRemote === DNS_PORT) {
-        udpHandler = setupUDPHandler(ws, version, rawClientData);
-        return true;
-      }
-      logErr('[VMESS] UDP only supported for DNS port 53');
-      ws.close();
-      return false;
+      const subscription = await buildSubscription(req);
+      res.writeHead(200, { 
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Access-Control-Allow-Origin': '*' 
+      });
+      res.end(Buffer.from(subscription).toString('base64') + '\n');
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Internal Server Error\n');
     }
-
-    let host = addressRemote;
-    try { host = await resolveHost(addressRemote); } catch { /* use domain */ }
-
-    tcpSocket = net.connect({ host, port: portRemote });
-    let responseHeader = version;
-
-    tcpSocket.on('connect', () => {
-      log(`[VMESS] connected ${addressRemote}:${portRemote}`);
-      if (rawClientData && rawClientData.length > 0) {
-        tcpSocket.write(Buffer.from(rawClientData));
-      }
-      for (const pw of pendingWrites) tcpSocket.write(Buffer.from(pw));
-      pendingWrites.length = 0;
-    });
-
-    tcpSocket.on('data', (chunk) => {
-      if (ws.readyState !== WebSocket.OPEN) { tcpSocket.destroy(); return; }
-      if (responseHeader) {
-        ws.send(Buffer.concat([Buffer.from(responseHeader), chunk]));
-        responseHeader = null;
-      } else {
-        ws.send(chunk);
-      }
-    });
-
-    tcpSocket.on('error', (e) => { logErr('[VMESS] tcp error:', e.message); ws.close(); });
-    tcpSocket.on('close', () => ws.close());
-
-    ws.on('close', () => { if (tcpSocket && !tcpSocket.destroyed) tcpSocket.destroy(); });
-    ws.on('error', () => { if (tcpSocket && !tcpSocket.destroyed) tcpSocket.destroy(); });
-
-    return true;
-  } catch (e) {
-    logErr('[VMESS] error:', e.message);
-    ws.close();
-    return false;
+    return;
   }
-}
 
-// ==================== WebSocket dispatcher ====================
+  // Routing Tampilan UI HTML
+  if (urlPath === '/' || urlPath === '/index.html') {
+    const filePath = path.join(__dirname, 'index.html');
+    fs.readFile(filePath, 'utf8', (err, content) => {
+      if (err) { 
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); 
+        res.end('<h3>Node Proxy UI Running. Subscriptions ready at /vercel</h3>'); 
+        return; 
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); 
+      res.end(content);
+    });
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not Found\n');
+});
+
+// ==================== WebSocket Dispatcher ====================
 const wss = new WebSocket.Server({ server: httpServer });
 wss.on('connection', (ws, req) => {
   const pathOnly = (req.url || '').split('?')[0];
 
   let handler;
-  if (pathOnly === WS_PATHS.vless)        handler = handleVlsConnection;
-  else if (pathOnly === WS_PATHS.trojan)  handler = handleTrojConnection;
-  else if (pathOnly === WS_PATHS.ss)      handler = handleSsConnection;
-  else if (pathOnly === WS_PATHS.vmess)   handler = handleVmessConnection;
+  if (pathOnly === WS_PATHS.vless) handler = handleVlsConnection;
+  else if (pathOnly === WS_PATHS.trojan) handler = handleTrojConnection;
+  else if (pathOnly === WS_PATHS.vmess) handler = handleVmessConnection;
   else { ws.close(); return; }
 
   ws.once('message', async (msg) => {
@@ -604,15 +793,14 @@ wss.on('connection', (ws, req) => {
       const ok = await handler(ws, msg);
       if (!ok && ws.readyState === WebSocket.OPEN) ws.close();
     } catch (e) {
-      logErr('[DISPATCH] error:', e.message);
+      logErr('[DISPATCH ERROR]', e.message);
       if (ws.readyState === WebSocket.OPEN) ws.close();
     }
   }).on('error', () => {});
 });
 
-// ==================== Start ====================
 httpServer.listen(PORT, () => {
-  console.log(`Server is running on ${PORT}`);
-  console.log(`UUID (env): ${UUID}`);
-  console.log(`WS paths → ${WS_PATHS.vless}, ${WS_PATHS.trojan}, ${WS_PATHS.ss}, ${WS_PATHS.vmess}`);
+  console.log(`Server aktif di port ${PORT}`);
+  console.log(`Subscription URL : /${SUB_PATH} atau /vercel`);
+  console.log(`WS Inbounds      : ${WS_PATHS.vless}, ${WS_PATHS.trojan}, ${WS_PATHS.vmess}`);
 });
