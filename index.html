@@ -26,7 +26,7 @@
         </div>
         <div>
           <h1 class="text-xl font-bold tracking-wider text-white">NODE_CONFIGS<span class="text-blue-500">.sys</span></h1>
-          <p class="text-xs text-slate-500">VLESS · Trojan · Shadowsocks</p>
+          <p class="text-xs text-slate-500">VLESS · Trojan · Shadowsocks · VMess</p>
         </div>
       </div>
       <button id="refreshBtn"
@@ -95,6 +95,7 @@
       <button data-filter="vless" class="filter-btn px-3 py-1.5 rounded-lg text-xs font-medium border transition">VLESS</button>
       <button data-filter="trojan" class="filter-btn px-3 py-1.5 rounded-lg text-xs font-medium border transition">TROJAN</button>
       <button data-filter="ss" class="filter-btn px-3 py-1.5 rounded-lg text-xs font-medium border transition">SS</button>
+      <button data-filter="vmess" class="filter-btn px-3 py-1.5 rounded-lg text-xs font-medium border transition">VMESS</button>
     </div>
 
     <!-- Config cards -->
@@ -140,11 +141,13 @@
       vless:  { label: 'VLESS',       color: 'purple', icon: 'fa-bolt' },
       trojan: { label: 'TROJAN',      color: 'orange', icon: 'fa-horse-head' },
       ss:     { label: 'SHADOWSOCKS', color: 'cyan',   icon: 'fa-shield-halved' },
+      vmess:  { label: 'VMESS',       color: 'rose',   icon: 'fa-paper-plane' },
     };
     const COLOR_CLASSES = {
       purple: { bg: 'bg-purple-500/10', border: 'border-purple-500/30', text: 'text-purple-400', hoverBorder: 'hover:border-purple-500' },
       orange: { bg: 'bg-orange-500/10', border: 'border-orange-500/30', text: 'text-orange-400', hoverBorder: 'hover:border-orange-500' },
       cyan:   { bg: 'bg-cyan-500/10',   border: 'border-cyan-500/30',   text: 'text-cyan-400',   hoverBorder: 'hover:border-cyan-500' },
+      rose:   { bg: 'bg-rose-500/10',   border: 'border-rose-500/30',   text: 'text-rose-400',   hoverBorder: 'hover:border-rose-500' },
     };
 
     const URI_STORE = {};
@@ -191,6 +194,7 @@
       if (uri.startsWith('vless://'))  return 'vless';
       if (uri.startsWith('trojan://')) return 'trojan';
       if (uri.startsWith('ss://'))     return 'ss';
+      if (uri.startsWith('vmess://'))  return 'vmess';
       return null;
     }
 
@@ -207,6 +211,13 @@
       if (lower.includes('security=none')) return false;
       if (lower.includes(';tls;') || lower.includes(';tls%3B') || lower.includes(';tls,') || lower.includes(';tls%2C')) return true;
       return /-TLS\b/i.test(name);
+    }
+
+    function parseVmessJson(uri) {
+      try {
+        const b64 = uri.slice('vmess://'.length).split('#')[0];
+        return JSON.parse(b64ToUtf8(b64));
+      } catch { return null; }
     }
 
     function renderCard(cfg) {
@@ -331,13 +342,26 @@
         decoded.split('\n').map(l => l.trim()).filter(Boolean).forEach((uri, idx) => {
           const type = detectType(uri);
           if (!type) return;
-          const name = extractName(uri, type);
-          const tls = detectTLS(uri, name);
-          let host = '', port = '';
-          try {
-            const m = uri.match(/@([^:?\/]+):(\d+)/);
-            if (m) { host = m[1]; port = m[2]; }
-          } catch {}
+
+          let name = type.toUpperCase(), tls = false, host = '', port = '';
+
+          if (type === 'vmess') {
+            const v = parseVmessJson(uri);
+            if (v) {
+              name = v.ps || 'VMESS';
+              tls  = v.tls === 'tls';
+              host = v.add || '';
+              port = String(v.port || '');
+            }
+          } else {
+            name = extractName(uri, type);
+            tls  = detectTLS(uri, name);
+            try {
+              const m = uri.match(/@([^:?\/]+):(\d+)/);
+              if (m) { host = m[1]; port = m[2]; }
+            } catch {}
+          }
+
           allConfigs.push({ id: idx, type, uri, name, tls, host, port });
         });
 
@@ -362,7 +386,7 @@
           statusBanner.querySelector('i').className = 'fa-solid fa-triangle-exclamation text-yellow-400 text-xl mt-1';
         } else {
           statusTitle.textContent = 'MODE DOMAIN — TLS + NON-TLS AKTIF';
-          statusDesc.textContent = 'Config VLESS (/vless), Trojan (/trojan), dan SS (/ss) digenerate otomatis dalam dua varian: TLS port 443 & NON-TLS port 80.';
+          statusDesc.textContent = 'Config VLESS (/vless), Trojan (/trojan), Shadowsocks (/ss), dan VMess (/vmess) digenerate otomatis dalam dua varian: TLS port 443 & NON-TLS port 80.';
           statusBanner.className = 'bg-green-500/5 border border-green-500/20 rounded-xl p-5 flex items-start gap-4';
           statusTitle.className = 'text-sm font-bold text-green-300 mb-1';
           statusBanner.querySelector('i').className = 'fa-solid fa-circle-check text-green-400 text-xl mt-1';
