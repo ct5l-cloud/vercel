@@ -10,44 +10,8 @@ const axios = require('axios');
 const { WebSocket, createWebSocketStream } = require('ws');
 const { subtle } = crypto.webcrypto;
 
-// ========================== UUID (auto-generate + simpan ke uuid.txt) ==========================
-function generateUUID() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
-
-function loadOrCreateUUID() {
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  // __dirname read-only di Vercel → fallback ke /tmp (writable antar warm invocations)
-  const files = [path.join(__dirname, 'uuid.txt'), path.join('/tmp', 'uuid.txt')];
-
-  for (const f of files) {
-    try {
-      const v = fs.readFileSync(f, 'utf8').trim();
-      if (UUID_REGEX.test(v)) {
-        console.log('[UUID] loaded from', f);
-        return v;
-      }
-    } catch {}
-  }
-
-  const newUUID = generateUUID();
-  for (const f of files) {
-    try {
-      fs.writeFileSync(f, newUUID, 'utf8');
-      console.log('[UUID] saved to', f, '→', newUUID);
-      return newUUID;
-    } catch {}
-  }
-  console.warn('[UUID] tidak bisa menulis uuid.txt, memakai ephemeral UUID:', newUUID);
-  return newUUID;
-}
-
 // ========================== Environment ==========================
-const UUID = loadOrCreateUUID();
+const UUID = process.env.UUID || 'd1cf4b9c-3e57-085d-b34a-797fcf601381';
 const SUB_PATH = process.env.SUB_PATH || 'vercel';
 const NAME = process.env.NAME || 'Vercel';
 const PORT = process.env.PORT || 3000;
@@ -649,6 +613,6 @@ wss.on('connection', (ws, req) => {
 // ==================== Start ====================
 httpServer.listen(PORT, () => {
   console.log(`Server is running on ${PORT}`);
-  console.log(`UUID: ${UUID}`);
+  console.log(`UUID (env): ${UUID}`);
   console.log(`WS paths → ${WS_PATHS.vless}, ${WS_PATHS.trojan}, ${WS_PATHS.ss}, ${WS_PATHS.vmess}`);
 });
